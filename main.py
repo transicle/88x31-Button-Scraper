@@ -4,8 +4,9 @@ import re
 import shutil
 import aiohttp
 
+from collections import deque
+from html import unescape
 from urllib.parse import urljoin, urlparse
-from urllib.request import Request, urlopen
 
 def what_os():
     if os.name == "nt":
@@ -37,6 +38,7 @@ class Scrape:
         self,
         output_folder="88x31",
         max_per_site=None,
+        max_pages_per_site=40,
         timeout=8,
         progress_every=50,
         max_consecutive_failures=60,
@@ -44,15 +46,24 @@ class Scrape:
     ):
         self.output_folder = output_folder
         self.max_per_site = max_per_site
+        self.max_pages_per_site = max_pages_per_site
         self.timeout = timeout
         self.progress_every = progress_every
         self.max_consecutive_failures = max_consecutive_failures
         self.max_workers = max_workers
 
-    def _fetch_text(self, url):
-        request = Request(url, headers={"User-Agent": "Mozilla/5.0 88x31-Button-Scraper"})
-        with urlopen(request, timeout=self.timeout) as response:
-            return response.read().decode("utf-8", errors="ignore")
+    async def _fetch_text_async(self, session, url):
+        async with session.get(url, allow_redirects=True) as response:
+            if response.status >= 400:
+                raise aiohttp.ClientResponseError(
+                    response.request_info,
+                    response.history,
+                    status=response.status,
+                    message=f"HTTP {response.status}",
+                    headers=response.headers,
+                )
+
+            return await response.text(errors="ignore")
 
     def _extract_image_urls(self, html, base_url):
         image_urls = []
@@ -95,8 +106,135 @@ class Scrape:
 
         return list(dict.fromkeys(page_urls))
 
-    def _resolve_tumblr_collection_pages(self, site_url):
-        tumblr_html = self._fetch_text(site_url)
+    def _normalize_url(self, url):
+        parsed = urlparse(url)
+        normalized_path = parsed.path or "/"
+        return parsed._replace(path=normalized_path, fragment="").geturl()
+
+    def _normalized_host(self, url):
+        return urlparse(url).netloc.lower().removeprefix("www.")
+
+    def _is_same_site(self, site_url, candidate_url):
+        return self._normalized_host(site_url) == self._normalized_host(candidate_url)
+
+    def _extract_anchor_links(self, html, base_url):
+        anchor_links = []
+        anchor_pattern = re.compile(
+            r'<a\b(?P<attrs>[^>]*)href=["\'](?P<href>[^"\']+)["\'](?P<rest>[^>]*)>(?P<text>.*?)</a>',
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+
+        for match in anchor_pattern.finditer(html):
+            href = match.group("href").strip()
+            full_url = self._normalize_url(urljoin(base_url, href))
+            parsed = urlparse(full_url)
+            if parsed.scheme not in {"http", "https"}:
+                continue
+
+            attrs = f'{match.group("attrs")} {match.group("rest")}'
+            rel_match = re.search(r'rel=["\']([^"\']+)["\']', attrs, flags=re.IGNORECASE)
+            anchor_text = re.sub(r"<[^>]+>", " ", match.group("text"))
+            anchor_text = unescape(" ".join(anchor_text.split())).lower()
+
+            anchor_links.append(
+                {
+                    "url": full_url,
+                    "href": href.lower(),
+                    "text": anchor_text,
+                    "rel": rel_match.group(1).lower() if rel_match else "",
+                }
+            )
+
+        return anchor_links
+
+    def _is_html_like_page(self, url):
+        path = urlparse(url).path.lower()
+        if not path or path.endswith("/"):
+            return True
+
+        _, ext = os.path.splitext(path)
+        return ext in {"", ".html", ".htm", ".php", ".asp", ".aspx", ".jsp"}
+
+    def _looks_like_gallery_page(self, url, anchor_text="", rel=""):
+        combined = " ".join(
+            [
+                urlparse(url).path.lower(),
+                urlparse(url).query.lower(),
+                anchor_text.lower(),
+                rel.lower(),
+            ]
+        )
+        return bool(
+            re.search(
+                r'88x31|buttons?|badges?|graphics|archives?|collection|catalog|webmaster',
+                combined,
+                flags=re.IGNORECASE,
+            )
+        )
+
+    def _looks_like_pagination_link(self, url, anchor_text="", rel=""):
+        parsed = urlparse(url)
+        combined = " ".join([parsed.path.lower(), parsed.query.lower(), anchor_text.lower(), rel.lower()])
+
+        if re.search(r'\bnext\b|\bolder\b|\bmore\b|\bforward\b', combined, flags=re.IGNORECASE):
+            return True
+        if re.search(r'page(?:=|/|-|_)?\d+|p=\d+|start=\d+|offset=\d+|collection-page\d+', combined, flags=re.IGNORECASE):
+            return True
+
+        stripped_text = anchor_text.strip()
+        return bool(re.fullmatch(r'\d{1,3}', stripped_text))
+
+    def _should_visit_discovered_page(self, site_url, candidate_url, anchor_text="", rel=""):
+        if not self._is_same_site(site_url, candidate_url):
+            return False
+        if not self._is_html_like_page(candidate_url):
+            return False
+
+        candidate_path = urlparse(candidate_url).path.lower()
+        seed_path = urlparse(site_url).path.lower()
+        seed_dir = seed_path.rsplit("/", 1)[0] if "/" in seed_path else seed_path
+        stays_near_seed = seed_dir and candidate_path.startswith(seed_dir)
+
+        return (
+            self._looks_like_pagination_link(candidate_url, anchor_text, rel)
+            or self._looks_like_gallery_page(candidate_url, anchor_text, rel)
+            or stays_near_seed
+        )
+
+    async def _discover_site_pages_async(self, session, site_url, extra_pattern=None, allow_generic=True):
+        pages_to_visit = deque([self._normalize_url(site_url)])
+        seen_pages = set()
+        resolved_pages = []
+
+        while pages_to_visit and len(resolved_pages) < self.max_pages_per_site:
+            page_url = pages_to_visit.popleft()
+            if page_url in seen_pages:
+                continue
+
+            seen_pages.add(page_url)
+            resolved_pages.append(page_url)
+
+            try:
+                page_html = await self._fetch_text_async(session, page_url)
+            except Exception:
+                continue
+
+            for link in self._extract_anchor_links(page_html, page_url):
+                candidate_url = link["url"]
+                if candidate_url in seen_pages or candidate_url in pages_to_visit:
+                    continue
+
+                if extra_pattern and re.search(extra_pattern, candidate_url, flags=re.IGNORECASE):
+                    pages_to_visit.append(candidate_url)
+                    continue
+
+                if allow_generic and self._should_visit_discovered_page(site_url, candidate_url, link["text"], link["rel"]):
+                    pages_to_visit.append(candidate_url)
+
+        return resolved_pages
+
+    async def _resolve_tumblr_collection_pages_async(self, session, site_url):
+        tumblr_html = await self._fetch_text_async(session, site_url)
         source_match = re.search(
             r'https://capstasher\.neocities\.org/88x31collection-page\d+\.html',
             tumblr_html,
@@ -119,7 +257,7 @@ class Scrape:
             resolved_pages.append(page_url)
 
             try:
-                page_html = self._fetch_text(page_url)
+                page_html = await self._fetch_text_async(session, page_url)
             except Exception:
                 continue
 
@@ -133,10 +271,30 @@ class Scrape:
 
         return resolved_pages
 
-    def _resolve_site_pages(self, site_url):
+    async def _resolve_dabamos_collection_pages_async(self, session, site_url):
+        return await self._discover_site_pages_async(
+            session,
+            site_url,
+            extra_pattern=r'/88x31(?:/[^?#]+)?(?:\.html?)?$',
+            allow_generic=False,
+        )
+
+    async def _resolve_neocities_collection_pages_async(self, session, site_url):
+        return await self._discover_site_pages_async(
+            session,
+            site_url,
+            extra_pattern=r'/(?:88x31|buttons?|badges?|graphics|collection)(?:/|[^?#])*',
+            allow_generic=False,
+        )
+
+    async def _resolve_site_pages_async(self, session, site_url):
         if "tumblr.com/capstasher-development" in site_url:
-            return self._resolve_tumblr_collection_pages(site_url)
-        return [site_url]
+            return await self._resolve_tumblr_collection_pages_async(session, site_url)
+        if "cyber.dabamos.de/88x31" in site_url:
+            return await self._resolve_dabamos_collection_pages_async(session, site_url)
+        if urlparse(site_url).netloc.lower().endswith("neocities.org"):
+            return await self._resolve_neocities_collection_pages_async(session, site_url)
+        return await self._discover_site_pages_async(session, site_url)
 
     def _safe_name_from_url(self, url):
         host = urlparse(url).netloc.lower().replace(":", "_")
@@ -256,7 +414,12 @@ class Scrape:
 
         total_downloaded = 0
 
-        timeout = aiohttp.ClientTimeout(total=self.timeout)
+        timeout = aiohttp.ClientTimeout(
+            total=self.timeout,
+            connect=self.timeout,
+            sock_connect=self.timeout,
+            sock_read=self.timeout,
+        )
         connector = aiohttp.TCPConnector(limit=self.max_workers, ttl_dns_cache=300)
         headers = {"User-Agent": "Mozilla/5.0 88x31-Button-Scraper"}
 
@@ -267,11 +430,17 @@ class Scrape:
 
                 print(f"Scraping {site}...")
                 try:
+                    print(f"  Resolving pages for {site_name}...")
+                    page_urls = await self._resolve_site_pages_async(session, site)
+                    print(f"  Resolved {len(page_urls)} page(s) for {site_name}.")
+
                     image_urls = []
-                    for page_url in self._resolve_site_pages(site):
-                        html = self._fetch_text(page_url)
+                    for page_index, page_url in enumerate(page_urls, start=1):
+                        print(f"  Scanning page {page_index}/{len(page_urls)}: {page_url}")
+                        html = await self._fetch_text_async(session, page_url)
                         image_urls.extend(self._extract_image_urls(html, page_url))
                     image_urls = list(dict.fromkeys(image_urls))
+                    print(f"  Found {len(image_urls)} candidate image(s) on {site_name}.")
                 except Exception as exc:
                     print(f"Skipping {site}: {exc}")
                     continue

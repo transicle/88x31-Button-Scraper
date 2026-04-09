@@ -16,3 +16,5 @@ $ pip install -r ./requirements.txt
 $ python main.py
 ```
 > Automatically detecting operating system for `.zip`/`.tar.gz` compression.
+
+If you need to tune crawling breadth in code, `Scrape(max_pages_per_site=40)` controls how many HTML pages are visited per seed URL.
