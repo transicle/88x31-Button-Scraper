@@ -1,4 +1,5 @@
 import asyncio
+import json
 import os
 import re
 import shutil
@@ -287,6 +288,18 @@ class Scrape:
             allow_generic=False,
         )
 
+    async def _collect_eightyeightthirtyone_images_async(self, session):
+        text = await self._fetch_text_async(session, "https://eightyeightthirty.one/graph.json")
+        data = json.loads(text)
+        seen = set()
+        image_urls = []
+        for hashes in data.get("images", {}).values():
+            for h in hashes:
+                if h not in seen:
+                    seen.add(h)
+                    image_urls.append(f"https://highway.eightyeightthirty.one/badge/{h}")
+        return image_urls
+
     async def _resolve_site_pages_async(self, session, site_url):
         if "tumblr.com/capstasher-development" in site_url:
             return await self._resolve_tumblr_collection_pages_async(session, site_url)
@@ -430,17 +443,22 @@ class Scrape:
 
                 print(f"Scraping {site}...")
                 try:
-                    print(f"  Resolving pages for {site_name}...")
-                    page_urls = await self._resolve_site_pages_async(session, site)
-                    print(f"  Resolved {len(page_urls)} page(s) for {site_name}.")
+                    if self._normalized_host(site) == "eightyeightthirty.one":
+                        print(f"  Fetching graph.json for {site_name}...")
+                        image_urls = await self._collect_eightyeightthirtyone_images_async(session)
+                        print(f"  Found {len(image_urls)} candidate image(s) on {site_name}.")
+                    else:
+                        print(f"  Resolving pages for {site_name}...")
+                        page_urls = await self._resolve_site_pages_async(session, site)
+                        print(f"  Resolved {len(page_urls)} page(s) for {site_name}.")
 
-                    image_urls = []
-                    for page_index, page_url in enumerate(page_urls, start=1):
-                        print(f"  Scanning page {page_index}/{len(page_urls)}: {page_url}")
-                        html = await self._fetch_text_async(session, page_url)
-                        image_urls.extend(self._extract_image_urls(html, page_url))
-                    image_urls = list(dict.fromkeys(image_urls))
-                    print(f"  Found {len(image_urls)} candidate image(s) on {site_name}.")
+                        image_urls = []
+                        for page_index, page_url in enumerate(page_urls, start=1):
+                            print(f"  Scanning page {page_index}/{len(page_urls)}: {page_url}")
+                            html = await self._fetch_text_async(session, page_url)
+                            image_urls.extend(self._extract_image_urls(html, page_url))
+                        image_urls = list(dict.fromkeys(image_urls))
+                        print(f"  Found {len(image_urls)} candidate image(s) on {site_name}.")
                 except Exception as exc:
                     print(f"Skipping {site}: {exc}")
                     continue
